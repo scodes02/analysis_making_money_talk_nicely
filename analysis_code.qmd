@@ -1,5 +1,5 @@
 ---
-title: "Analysis of Biodiversity Impact tools"
+title: "Analysis of biodiversity impact tools"
 author: "Sam Hickman, Billy Geary, Matthew Cantele"
 format:
   html: 
