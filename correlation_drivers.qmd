@@ -1,0 +1,147 @@
+---
+title: "FT Teasing Out Drivers"
+format: html
+editor: visual
+---
+
+## Packages
+
+```{r}
+library(tidyverse)
+library(janitor)
+library(readxl)
+library(xtable)
+```
+
+## Read in data
+
+Company data
+
+```{r}
+# Company data
+company_data <- read_excel('/Users/samuelhickman/Library/CloudStorage/OneDrive-SharedLibraries-TheUniversityofMelbourne/Franklin Templeton - General/FT R Project/data/raw_data/s&p/S&P500_ISIN_TICKERS.xlsx') |> 
+  clean_names() |> 
+  select(companyid,isin,companyname,tickersymbol) |> 
+  rename(ticker=tickersymbol)
+
+tool_dat_import <- read.csv("data/tool_data/cleaned_data/tool_dat.csv") |> select(isin,sales)
+
+company_data <- company_data |> 
+  left_join(tool_dat_import, by ="isin")
+```
+
+Tool data
+
+```{r}
+# GIST Data
+gist_data_raw <- read_csv('data/raw_data/GIST/GIST_Impact_PDF_SP500_2018_2022.csv') |>
+  clean_names() |> 
+  select(-x1) |>                              
+  group_by(isin) |> 
+  filter(reporting_year == max(reporting_year, na.rm = TRUE)) |>  
+  distinct() |> 
+  summarise(
+    impact_year = first(reporting_year),       
+    across(
+      where(is.double),                        
+      ~ sum(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+# MSCI Data
+msci_data_raw <- read_excel('data/raw_data/msci/msci_all.xlsx') |> 
+  clean_names() |> 
+  filter(global_species_extinct_water_year_recent == max(global_species_extinct_water_year_recent, na.rm = TRUE)) |> 
+  distinct()
+```
+
+## Clean and extract data
+
+```{r}
+# GIST data will all possible impact drivers
+gist_full_bio_dat <- gist_data_raw |> 
+  select(
+    isin, 
+    # total_global_pdf,
+    ghg_total_pdf,       # Total global Potentially Disappeared Fraction (PDF) due to the corporation's activities.
+    water_consumed_pdf,  # PDF for water consumed. 
+    # sox_pdf,             # PDF from SOX emissions.
+    # nox_pdf,             # PDF from NOX emissions.
+    # nitrogen_pdf,        # PDF from nitrogen release.
+    # phosphorous_pdf,     # PDF from phosphorous release.
+    # waste_non_haz_pdf,   # PDF from non-hazardous waste.
+    # waste_haz_pdf,       # PDF from hazardous waste.
+    land_occ_total_pdf   # Total PDF from all land occupation types.
+  ) |> 
+  mutate(across(
+    c(
+      ghg_total_pdf, 
+      water_consumed_pdf,
+      land_occ_total_pdf), as.numeric)) |> 
+  distinct()
+    
+# MSCI data will all possible impact drivers
+msci_full_bio_dat <- msci_data_raw |> 
+  select(
+    client_id, 
+    global_species_extinct_recent,         # Contribution to irreversible extinction via spatial, water, GHG
+    global_pot_species_extinct_ghg_recent, # GHG-specific extinction contribution
+    global_species_extinct_spatial_recent, # Spatial footprint-specific extinction contribution
+    global_species_extinct_water_recent    # Water footprint-specific extinction contribution 
+  ) |> 
+  mutate(across(
+    c(
+      global_species_extinct_recent,
+      global_pot_species_extinct_ghg_recent,
+      global_species_extinct_spatial_recent,
+      global_species_extinct_water_recent
+    ),
+    as.numeric
+  )) |> 
+  rename(isin = client_id) |> 
+  distinct() 
+```
+
+## Teasing our high correlation between GIST and MSCI
+
+```{r}
+# Which drivers are driving that correlation?
+driver_pairs <- tribble(
+  ~gist,                 ~msci,                                   ~driver,
+  "ghg_total_pdf",       "global_pot_species_extinct_ghg_recent", "GHG",
+  "water_consumed_pdf",  "global_species_extinct_water_recent",   "Water",
+  "land_occ_total_pdf",  "global_species_extinct_spatial_recent", "Land"
+)
+
+driver_corr <- driver_pairs |>
+  pmap_dfr(function(gist, msci, driver) {
+    tmp <- gist_full_bio_dat |>
+      select(isin, !!gist) |>
+      inner_join(msci_full_bio_dat |> select(isin, !!msci), by = "isin") |>
+      drop_na()
+    tibble(
+      `Biodiversity Impact Driver` = driver,
+      `Spearman Correlation`    = cor(tmp[[gist]], tmp[[msci]], method = "spearman")
+    )
+  })
+
+driver_corr
+```
+
+## Save as a latex table
+
+```{r}
+# Create an xtable object from your tibble/dataframe
+xtab <- xtable(driver_corr, 
+               caption = "Spearman correlation between GIST and MSCI biodiversity drivers", 
+               label = "tab:driver_corr")
+
+# Save to file
+print(xtab, 
+      file = "latex_tables/driver_corr_table.tex", 
+      include.rownames = FALSE,  
+      caption.placement = "top", 
+      sanitize.text.function = identity) 
+```
+
