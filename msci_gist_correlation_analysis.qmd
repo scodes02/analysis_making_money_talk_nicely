@@ -129,19 +129,3 @@ driver_corr <- driver_pairs |>
 driver_corr
 ```
 
-## Save as a latex table
-
-```{r}
-# Create an xtable object from your tibble/dataframe
-xtab <- xtable(driver_corr, 
-               caption = "Spearman correlation between GIST and MSCI biodiversity drivers", 
-               label = "tab:driver_corr")
-
-# Save to file
-print(xtab, 
-      file = "latex_tables/driver_corr_table.tex", 
-      include.rownames = FALSE,  
-      caption.placement = "top", 
-      sanitize.text.function = identity) 
-```
-
