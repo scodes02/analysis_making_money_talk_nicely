@@ -19,7 +19,7 @@ Company data
 
 ```{r}
 # Company data
-company_data <- read_excel('/Users/samuelhickman/Library/CloudStorage/OneDrive-SharedLibraries-TheUniversityofMelbourne/Franklin Templeton - General/FT R Project/data/raw_data/s&p/S&P500_ISIN_TICKERS.xlsx') |> 
+company_data <- read_excel('data/raw_data/s&p/S&P500_ISIN_TICKERS.xlsx') |> 
   clean_names() |> 
   select(companyid,isin,companyname,tickersymbol) |> 
   rename(ticker=tickersymbol)
