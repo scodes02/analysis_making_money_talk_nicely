@@ -1,4 +1,4 @@
-# Authors: M Cantele, S Hickman
+# Authors: M Cantele
 
 # Targets from here ------------------------------------------------------------
 
