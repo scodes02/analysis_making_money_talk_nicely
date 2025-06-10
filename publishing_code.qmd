@@ -1,6 +1,6 @@
 ---
 title: "Analysis of Biodiversity Impact tools"
-author: "Sam Hickman, Billy Geary, Matthew Cantele"
+author: "Sam Hickman, Billy Geary"
 format:
   html: 
     embed-resources: true
