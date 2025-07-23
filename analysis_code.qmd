@@ -1,0 +1,752 @@
+---
+title: "Analysis of Biodiversity Impact tools"
+author: "Sam Hickman, Billy Geary"
+format:
+  html: 
+    embed-resources: true
+    code-fold: true
+editor: visual
+---
+
+# Read in packages
+
+Reads in the packages necessary to complete the analysis.
+
+```{r, message=FALSE}
+library(broom.mixed)
+library(brms)
+library(emmeans)
+library(flextable)
+library(officer)
+library(patchwork)
+library(readxl)
+library(targets)
+library(tidytext)
+library(tidyverse)
+library(xtable)
+```
+
+# Run targets pipeline
+
+```{r}
+tar_make() # Run the targets pipeline
+
+tar_visnetwork() # Analysis overview
+```
+
+# Read in data
+
+Reads in the necessary data and combines the data based on attributes.
+
+```{r}
+# Import the ranking data
+tool_dat_import <- read.csv("data/tool_data/cleaned_data/tool_dat.csv")
+
+tool_dat_join <- tool_dat_import |>
+  rename(metric_name = variable) |>
+  mutate(metric_name = case_when(
+    metric_name == "Aggregate Impact: Ecosystem Footprint (HSA)" ~ "Aggregate_Impact_Ecosystem_Footprint_HSA",
+    metric_name == "CBF Value" ~ "CBF_Value",
+    metric_name == "CBF Indicator Sales Value" ~ "CBF_Indicator_Sales_Value",
+    metric_name == "GLOBAL SPECIES EXTINCT INTENS RECENT" ~ "GLOBAL_SPECIES_EXTINCT_INTENS_RECENT",
+    TRUE ~ metric_name
+  ))
+
+tool_attributes <- read_excel("data/tool_attributes.xlsx")
+
+tool_attributes_join <- tool_attributes |>
+  select(-tool)
+
+tool_dat <- left_join(tool_dat_join, tool_attributes_join, by = "metric_name") 
+
+# Check the number of datapoints each tool provides that was ranked
+number_of_points <- tool_dat |>
+  group_by(tool, value_adjusted) |>
+  filter(!is.na(rank)) |>
+  tally() |>
+  arrange(tool)
+
+number_of_points
+```
+
+# Correlation plots
+
+Spearman Rank Correlation is utilized to look at the correlation between the ranks of companies according to each tool. Higher correlation = more similar rankings of the S&P500.
+
+```{r}
+# Create wide data frames for aggregate (agg) vs. value-adjusted (va)
+wide_dat_agg <- tool_dat |>
+  filter(value_adjusted == FALSE) |>
+  drop_na(rank) |>
+  pivot_wider(id_cols = c(isin, ticker),
+              names_from = tool,
+              values_from = rank,
+              values_fn   = mean)
+
+wide_dat_va <- tool_dat |>
+  filter(value_adjusted == TRUE) |>
+  drop_na(rank) |>
+  pivot_wider(id_cols = c(isin, ticker),
+              names_from = tool,
+              values_from = rank,
+              values_fn   = mean)
+
+# Pick the same tool columns in both data frames (columns 3..10 here)
+common_tools <- intersect(names(wide_dat_agg)[3:10],
+                          names(wide_dat_va)[3:10])
+
+# Subset them
+wide_agg2 <- wide_dat_agg[, common_tools]
+wide_va2  <- wide_dat_va[, common_tools]
+
+# Compute Spearman correlations
+cor.mat.agg <- cor(wide_agg2, method = "spearman", use = "pairwise.complete.obs")
+cor.mat.va  <- cor(wide_va2, method = "spearman", use = "pairwise.complete.obs")
+
+desired_order_raw <- c("BIA_GBS", "FS", "GID", "GIST",
+                       "IDL", "MSCI", "NAlpha", "S&PS1")
+
+cor.mat.agg <- cor.mat.agg[desired_order_raw, desired_order_raw]
+cor.mat.va  <- cor.mat.va [desired_order_raw, desired_order_raw]
+
+
+combined_mat <- cor.mat.va                     
+combined_mat[upper.tri(combined_mat)] <-
+  cor.mat.agg[upper.tri(cor.mat.agg)]          
+
+diag(combined_mat) <- NA                       
+
+label_map <- c(BIA_GBS = "BIA-GBS",
+               FS      = "FSupply")
+
+df <- as.data.frame(combined_mat) |>
+  rownames_to_column("Var1") |>
+  pivot_longer(-Var1, names_to = "Var2", values_to = "value") |>
+  mutate(
+    value_label = round(value, 2),
+    Var1 = factor(recode(Var1, !!!label_map), levels = recode(desired_order_raw, !!!label_map)),
+    Var2 = factor(recode(Var2, !!!label_map), levels = recode(desired_order_raw, !!!label_map))
+  )
+
+n <- length(levels(df$Var1))
+
+combined_corr_plot <- ggplot(df, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = ifelse(!is.na(value), value_label, "")), size = 3) +
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue",
+                       midpoint = 0, limits = c(-1, 1), name = "Correlation") +
+  coord_fixed(clip = "off") +
+  annotate("segment", x = 0.5, y = 0.5, xend = n + 0.5, yend = n + 0.5,
+           colour = "black", linetype = "dashed", size = 0.6) +
+  labs(title   = "(a) Aggregate metric results",
+       caption = "(b) Value-adjusted metric results") +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.title      = element_blank(),
+    axis.text.x     = element_text(size = 8, angle = 45, hjust = 1),
+    axis.text.y     = element_text(size = 8),
+    panel.grid      = element_blank(),
+    legend.position = "right",
+    legend.title    = element_text(size = 7),
+    legend.text     = element_text(size = 7),
+    plot.title      = element_text(size = 10),
+    plot.caption    = element_text(size = 10, hjust = 1)
+  ) +
+  guides(fill = guide_colorbar(barwidth = 1, barheight = 10))
+
+combined_corr_plot
+```
+
+# Regression analysis
+
+## Data cleaning and preparation
+
+```{r}
+# Scale and centre the raw data for each tool / value-adjusted
+tool_dat <- tool_dat |>
+  group_by(tool, value_adjusted) |>
+  mutate(rank_scaled = (rank - 1) / max(rank, na.rm = TRUE)) |>
+  mutate(meansd_scaled = scale(value)) |>
+  ungroup()
+
+# Set characters to factors
+tool_dat$pdf <- as_factor(tool_dat$pdf)
+tool_dat$LC_Impact_no_NAlpha <- as_factor(tool_dat$LC_Impact_no_NAlpha)
+tool_dat$LC_Impact <- as_factor(tool_dat$LC_Impact)
+tool_dat$GLOBIO <- as_factor(tool_dat$GLOBIO)
+tool_dat$STAR <- as_factor(tool_dat$STAR)
+tool_dat$msa <- as_factor(tool_dat$msa)
+tool_dat$vc_upstream_only <- as_factor(tool_dat$vc_upstream_only)
+tool_dat$vc_full_value_chain <- as_factor(tool_dat$vc_full_value_chain)
+tool_dat$vc_direct_only <- as_factor(tool_dat$vc_direct_only)
+tool_dat$GICS_sector <- as_factor(tool_dat$GICS_sector)
+
+# Place ranking on a 0-1 scale for beta regression
+# Add epsilon adjustment to get away from 0 and 1
+epsilon <- 0.001
+tool_dat$rank_scaled <- tool_dat$rank_scaled * (1 - 2 * epsilon) + epsilon
+
+# Filter Aggregate Values (agg)
+tool_dat_agg <- tool_dat |>
+  filter(value_adjusted == FALSE) |>
+  drop_na(rank, GICS_sector) |>
+  filter(
+    GICS_sector != "",
+    tool != "BIA_GBS"
+  ) # Remove BIA-GBS as we know their sample is skewed high which will impact results
+
+# Filter Value Adjusted Values (va)
+tool_dat_va <- tool_dat |>
+  filter(value_adjusted == TRUE) |>
+  drop_na(rank, GICS_sector) |>
+  filter(
+    GICS_sector != "",
+    tool != "BIA_GBS"
+  ) # Remove BIA-GBS as we know their sample is skewed high which will impact results
+```
+
+## Models
+
+Large model 1
+
+```{r}
+large_model_1 <- brm(
+  formula = rank_scaled ~ GICS_sector * (STAR + GLOBIO + LC_Impact + vc_direct_only),
+  data = tool_dat_va,
+  family = "beta",
+  chains = 3,
+  cores = 3,
+  iter = 3000
+)
+
+summary(large_model_1)
+
+
+large_model_1_no_s <- brm(
+  formula = rank_scaled ~ GICS_sector * (GLOBIO + LC_Impact + vc_direct_only),
+  data = tool_dat_va,
+  family = "beta",
+  chains = 3,
+  cores = 3,
+  iter = 3000
+)
+```
+
+## Regression plot
+
+Combined Interaction Effects – Consumer Staples & Real Estate
+
+```{r}
+# Define the two sectors to plot
+two_sectors_to_plot <- c("Consumer Staples", "Utilities")
+
+# Helper to extract and label EMM results
+extract_emm <- function(model, 
+                        by_var, 
+                        effect_name, 
+                        sectors_to_plot = two_sectors_to_plot) {
+  emm <- emmeans(model, as.formula(paste0("~ GICS_sector | ", by_var)), type = "response")
+  as.data.frame(emm) |>
+    filter(GICS_sector %in% sectors_to_plot) |>
+    mutate(
+      Effect = effect_name,
+      Usage  = factor(get(by_var), levels = c(0,1), labels = c("No","Yes"))
+    )
+}
+
+# Gather EMM data for three interactions (excluding STAR)
+emm_globio <- extract_emm(large_model_1, "GLOBIO",         "GLOBIO",               two_sectors_to_plot)
+emm_lci    <- extract_emm(large_model_1, "LC_Impact",      "LC-Impact",            two_sectors_to_plot)
+emm_direct <- extract_emm(large_model_1, "vc_direct_only", "Direct impacts\nonly", two_sectors_to_plot)
+
+# Combine into one data frame
+emm_df <- bind_rows(emm_globio, emm_lci, emm_direct)
+
+# Plot: facet by sector, show three effects per panel with two-colour scheme
+plot_interactions_two <- ggplot(emm_df, aes(x = Effect, y = response, color = Usage)) +
+  geom_point(position = position_dodge(width = 0.35), size = 3) +
+  geom_errorbar(aes(ymin = lower.HPD, ymax = upper.HPD), position = position_dodge(width = 0.35), width = 0.2) +
+  facet_wrap(~ GICS_sector, ncol = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+  labs(
+    x     = NULL,
+    y     = "Predicted Rank (0–1)",
+    color = NULL
+  ) +
+  scale_color_manual(values = c("No" = "lightgrey", "Yes" = "black")) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x       = element_text(angle = 45, hjust = 1, size = 10),
+    strip.background  = element_rect(fill = "grey90", color = NA),
+    strip.text        = element_text(face = "bold", size = 12),
+    legend.position   = "bottom",
+    legend.text       = element_text(size = 10),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor  = element_blank()
+  )
+
+plot_interactions_two
+
+
+# Define all GICS sectors
+gics_sectors <- unique(tool_dat$GICS_sector)
+
+emm_globio <- extract_emm(large_model_1, "GLOBIO",         "GLOBIO",               gics_sectors)
+emm_lci    <- extract_emm(large_model_1, "LC_Impact",      "LC-Impact",            gics_sectors)
+emm_direct <- extract_emm(large_model_1, "vc_direct_only", "Direct impacts\nonly", gics_sectors)
+emm_star   <- extract_emm(large_model_1, "STAR",          "STAR",                  gics_sectors)
+
+# Combine into one data frame
+emm_df <- bind_rows(emm_globio, emm_lci, emm_direct, emm_star)
+
+(full_interactions <- ggplot(emm_df, aes(x = Effect, y = response, color = Usage)) +
+  geom_point(position = position_dodge(width = 0.35), size = 3) +
+  geom_errorbar(aes(ymin = lower.HPD, ymax = upper.HPD), 
+                position = position_dodge(width = 0.35), width = 0.2) +
+  facet_wrap(~ GICS_sector, ncol = 2) +
+  scale_x_discrete(labels = function(x) str_wrap(x, width = 10)) +
+  labs(
+    x     = NULL,
+    y     = "Predicted Rank (0–1)",
+    color = NULL
+  ) +
+  scale_color_manual(values = c("No" = "lightgrey", "Yes" = "black")) +
+  theme_bw(base_size = 14) +
+  theme(
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 10),
+    strip.background   = element_rect(fill = "grey90", color = NA),
+    strip.text         = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position      = c(0.75, -0.01), 
+    legend.direction     = "horizontal",  
+    legend.box.just      = "left",
+    legend.background    = element_rect(fill = "white", color = NA, size = 0.2),
+    legend.key           = element_rect(fill = "white", color = NA),
+    legend.title         = element_blank(),
+    legend.text          = element_text(size = 10)
+  ))
+
+full_interactions
+```
+
+## Table of regression results
+
+```{r}
+fixef_df <- tidy(
+  large_model_1,
+  effects    = "fixed",
+  conf.int   = TRUE,
+  conf.level = 0.95
+) |>
+  rename(
+    Parameter   = term,
+    Mean        = estimate,
+    `SD`        = std.error,
+    `2.5%`      = conf.low,
+    `97.5%`     = conf.high
+  )
+
+fixef_df_xt <- xtable(fixef_df, 
+                      caption = "Posterior summaries for large_model_1", 
+                      label = "tab:regression_summary")
+
+# Save as .tex
+print(fixef_df_xt, 
+      file = "latex_tables/large_model_1_summary.tex",
+      include.rownames = FALSE,
+      caption.placement = "top",
+      booktabs = TRUE) 
+```
+
+# Number of tools that ranked healthcare companies higher than energy
+
+```{r}
+health_ranks <- tool_dat |> 
+  filter(value_adjusted == FALSE,
+         GICS_sector == "Health Care",
+         !is.na(rank)) |> 
+  pull(rank)
+
+energy_ranks <- tool_dat |> 
+  filter(value_adjusted == FALSE,
+         GICS_sector == "Energy",
+         !is.na(rank)) |> 
+  pull(rank)
+
+median_energy_by_tool <- median(energy_ranks)
+
+num_health_above_median_energy <- sum(health_ranks > median_energy_by_tool)
+
+num_health_above_median_energy
+
+# By tool
+median_energy_by_tool <- tool_dat |> 
+  filter(value_adjusted == FALSE,
+         GICS_sector == "Energy",
+         !is.na(rank)) |> 
+  group_by(tool) |> 
+  summarise(median_energy_rank = median(rank, na.rm = TRUE),
+            .groups = "drop")
+
+health_above_median_by_tool <- tool_dat |> 
+  filter(value_adjusted == FALSE,
+         GICS_sector == "Health Care",
+         !is.na(rank)) |> 
+  left_join(median_energy_by_tool, by = "tool") |> 
+  group_by(tool) |> 
+  summarise(n_health = n(),
+            n_above_energy_median = sum(rank > median_energy_rank),
+            .groups = "drop")
+
+health_above_median_by_tool
+```
+
+# Top ten bottom ten analysis
+
+```{r}
+# Define heatmap colours
+color_map_freq_high <- c(
+  "1" = "#A3ACB9",  
+  "2" = "#FFBC79",  
+  "3" = "#FF7F0E",  
+  "4" = "#D62728"   
+)
+
+# Aggregate top ten
+ten_highest_impact_wide_agg <- tool_dat |> 
+  filter(value_adjusted == FALSE, tool != "BIA_GBS") |>
+  group_by(tool) |>
+  slice_max(rank, n = 10, with_ties = FALSE) |>
+  mutate(worst_rank_order = row_number(desc(rank))) |>
+  ungroup() |>
+  select(tool, ticker, worst_rank_order) |>
+  pivot_wider(names_from = tool, values_from = ticker) |>
+  arrange(worst_rank_order) |> 
+  rename(FSupply = FS)
+
+# Plot
+ten_highest_impact_plot_agg <- ten_highest_impact_wide_agg |>
+  pivot_longer(
+    cols      = -worst_rank_order,
+    names_to  = "Tool",
+    values_to = "Ticker"
+  ) |>
+  drop_na(Ticker) |>
+  group_by(Ticker) |>
+  mutate(freq = n()) |>
+  ungroup() |>
+  mutate(freq = factor(freq)) |>
+  ggplot(aes(x = Tool,
+             y = factor(worst_rank_order, levels = rev(unique(worst_rank_order))),
+             fill = freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Ticker), color = "black", size = 3, fontface = "bold") +
+  scale_fill_manual(
+    values = color_map_freq_high,
+    name   = "Frequency\nof Occurrence"  
+  ) +
+  labs(
+    title = "(a) Aggregate metric rankings",
+    y     = "Impact rank (1 = highest impact)",
+    x     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid = element_blank()
+  )
+
+# Value-adjusted top ten
+ten_highest_impact_wide_va <- tool_dat |>
+  filter(value_adjusted == TRUE, tool != "BIA_GBS") |>
+  group_by(tool) |>
+  slice_max(rank, n = 10, with_ties = FALSE) |>
+  mutate(worst_rank_order = row_number(desc(rank))) |>
+  ungroup() |>
+  select(tool, ticker, worst_rank_order) |>
+  pivot_wider(names_from = tool, values_from = ticker) |>
+  arrange(worst_rank_order) |> 
+  rename(FSupply = FS)
+
+# Plot
+ten_highest_impact_plot_va <- ten_highest_impact_wide_va |>
+  pivot_longer(
+    cols      = -worst_rank_order,
+    names_to  = "Tool",
+    values_to = "Ticker"
+  ) |>
+  drop_na(Ticker) |>
+  group_by(Ticker) |>
+  mutate(freq = n()) |>
+  ungroup() |>
+  mutate(freq = factor(freq)) |>
+  ggplot(aes(x = Tool,
+             y = factor(worst_rank_order, levels = rev(unique(worst_rank_order))),
+             fill = freq)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = Ticker), color = "black", size = 3, fontface = "bold") +
+  scale_fill_manual(
+    values = color_map_freq_high,
+    name   = "Frequency\nof Occurrence",
+    guide  = NULL                
+  ) +
+  labs(
+    title = "(b) Value-adjusted metric rankings",
+    x     = NULL,
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid   = element_blank(),
+    axis.text.y  = element_blank(),
+    axis.ticks.y = element_blank()
+  )
+
+# Combine and consolidate legend
+combined_plot_top10 <- (ten_highest_impact_plot_agg + ten_highest_impact_plot_va) +
+  plot_layout(nrow = 1, guides = "collect") &
+  theme(legend.position = "bottom")
+
+combined_plot_top10
+```
+
+# Sector Boxplots
+
+## GICS Sectors overall - aggregate metrics
+
+```{r}
+sector_plot_data <- tool_dat |>
+  filter(value_adjusted == FALSE,
+         !tool == "BIA_GBS") |>
+  group_by(GICS_sector) |>
+  mutate(median_rank = median(rank, na.rm = TRUE)) |>
+  ungroup() |>
+  mutate(GICS_sector = fct_reorder(GICS_sector, median_rank))
+  
+# Function to wrap text on x-axis
+scale_x_reordered(
+  labels = function(x) {
+    stringr::str_wrap(                  
+      stringr::str_replace(x, "___.*$", ""),
+      width = 12
+    )
+  }
+)
+
+sector_plot <- ggplot(sector_plot_data, aes(x = GICS_sector, y = rank, fill = GICS_sector)) +
+  geom_boxplot(alpha = 0.8) +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.5, colour = "black") +
+  scale_x_reordered(
+    labels = function(x) {
+      stringr::str_wrap(stringr::str_replace(x, "___.*$", ""), width = 12)
+    }) + 
+  scale_fill_brewer(palette = "Set3", guide = FALSE) +
+  labs(
+    x        = "GICS Sector",
+    y        = "Impact Rank"
+  ) +
+  theme_bw(base_size = 14) +
+  theme(
+    plot.title        = element_text(face = "bold", size = 16, hjust = 0.5),
+    plot.subtitle     = element_text(size = 12, margin = margin(b = 10), hjust = 0.5),
+    axis.text.x       = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+sector_plot
+```
+
+## Boxplots of each tools assessment of the sectors
+
+Faceted box-plots: 8 individual tools
+
+```{r}
+# Define tools
+tools <- c("S&PS1", "MSCI", "IDL", "GID", "FSupply", "GIST", "NAlpha", "BIA-GBS")
+
+# Filter data
+plot_dat <- tool_dat |>
+  filter(value_adjusted == FALSE) |>
+  drop_na(rank, GICS_sector) |> 
+  mutate(tool = recode(tool, FS = "FSupply", BIA_GBS = "BIA-GBS"))
+
+# Define concistsent sector colours sector colours
+sector_names <- sort(unique(plot_dat$GICS_sector))
+sector_cols  <- setNames(RColorBrewer::brewer.pal(length(sector_names), "Set3"),
+                         sector_names)
+
+# Order sectors within each facet (median rank)
+plot_dat <- plot_dat |>
+  mutate(sector_fac = reorder_within(GICS_sector, rank, tool, fun = median))
+
+# Plot
+sector_box_all <- ggplot(plot_dat,
+                         aes(x = sector_fac, y = rank, fill = GICS_sector)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.85) +
+  geom_jitter(width = 0.2, size = 1.3, alpha = 0.4, colour = "black") +
+  facet_wrap(~ tool, ncol = 2, scales = "free_x") +
+  scale_x_reordered(
+    labels = function(x) {
+      stringr::str_wrap(stringr::str_replace(x, "___.*$", ""), width = 12)
+    }
+  ) +
+  scale_fill_manual(values = sector_cols, guide = "none") +
+  labs(
+    x = NULL,
+    y = "Impact rank (1 = Least Impactful)"
+  ) +
+  theme_bw(base_size = 13) +
+  theme(
+    axis.text.x        = element_text(angle = 45, hjust = 1, vjust = 1),
+    strip.text         = element_text(face = "bold", size = 12),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(hjust = 0.5)
+  )
+
+sector_box_all
+```
+
+## Number of companies in Health Care above median Energy rank
+
+```{r}
+# median energy rank
+med_energy <- tool_dat |>
+  filter(GICS_sector == "Energy") |>
+  summarise(med = median(rank, na.rm = TRUE)) |>
+  pull(med)
+
+hc_above_energy <- tool_dat |>
+  filter(GICS_sector == "Health Care",
+         rank >= med_energy) |> 
+  distinct(ticker) |> 
+  tally()
+
+hc_above_energy
+```
+
+# Saving plots for NSustainability
+
+```{r}
+# Figure 1: Correlation box plot
+ggsave(
+  filename = "nsustainability_plots/figure_1.pdf",
+  plot     = combined_corr_plot,
+  width    = 8,
+  height   = 5,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "nsustainability_plots/figure_1.eps",
+  plot     = combined_corr_plot,
+  width    = 8,
+  height   = 5,
+  units    = "in",
+  device   = "eps"
+)
+
+# Figure 2: Top ten analysis heatmap
+ggsave(
+  filename = "nsustainability_plots/figure_2.pdf",
+  plot     = combined_plot_top10,
+  width    = 10,
+  height   = 5,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "nsustainability_plots/figure_2.eps",
+  plot     = combined_plot_top10,
+  width    = 10,
+  height   = 5,
+  units    = "in",
+  device   = "eps"
+)
+
+# Figure 3: Regression interaction plot
+ggsave(
+  filename = "nsustainability_plots/figure_3.pdf",
+  plot     = plot_interactions_two,
+  width    = 12,
+  height   = 6,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "nsustainability_plots/figure_3.eps",
+  plot     = plot_interactions_two,
+  width    = 12,
+  height   = 6,
+  units    = "in",
+  device   = "eps"
+)
+
+# Figure 4: Sector boxplots (all tools)
+ggsave(
+  filename = "nsustainability_plots/figure_4.pdf",
+  plot     = sector_plot,
+  width    = 14,
+  height   = 10,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+
+ggsave(
+  filename = "nsustainability_plots/figure_4.eps",
+  plot     = sector_plot,
+  width    = 14,
+  height   = 10,
+  units    = "in",
+  device   = "eps"
+)
+
+# Supplementary Figure 1: Full regression interactions by GICS sector
+ggsave(
+  filename = "nsustainability_plots/supplementary_figure_1.pdf",
+  plot     = full_interactions,
+  width    = 16,         
+  height   = 10,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "nsustainability_plots/supplementary_figure_1.eps",
+  plot     = full_interactions,
+  width    = 16,
+  height   = 10,
+  units    = "in",
+  device   = "eps"
+)
+
+# Supplementary Figure 2: Boxplot by tool facets
+ggsave(
+  filename = "nsustainability_plots/supplementary_figure_2.pdf",
+  plot     = sector_box_all,
+  width    = 14,
+  height   = 10,
+  units    = "in",
+  dpi      = 450,
+  bg       = "white"
+)
+
+ggsave(
+  filename = "nsustainability_plots/supplementary_figure_2.eps",
+  plot     = sector_box_all,
+  width    = 14,
+  height   = 10,
+  units    = "in",
+  device   = "eps"
+)
+```
